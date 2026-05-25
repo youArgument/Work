@@ -33,22 +33,26 @@ with left_col:
     selected_file_idx = st.selectbox("Сектор", range(len(files)), format_func=lambda i: os.path.basename(files[i]), key="an_file")
 
     if show_all:
-        all_mag, all_vel, all_acc = [], [], []
+        all_mag, all_vel, all_acc, all_odom = [], [], [], []
         for f in files:
             d = np.load(f)
             all_mag.append(d["magnetogram"])
             all_vel.append(d["velocity"])
             all_acc.append(d["accelerometer"])
+            all_odom.append(float(d["odomstep"]))
         magnetogram = np.concatenate(all_mag, axis=0)
         velocity = np.concatenate(all_vel, axis=0)
         accelerometer = np.concatenate(all_acc, axis=0)
+        odomstep = np.mean(all_odom)
     else:
         d = np.load(files[selected_file_idx])
         magnetogram = d["magnetogram"]
         velocity = d["velocity"]
         accelerometer = d["accelerometer"]
+        odomstep = float(d["odomstep"])
 
     n_steps, n_channels = magnetogram.shape
+    depth = np.arange(n_steps) * odomstep
 
     st.divider()
     st.header("🔬 Метод детекции")
@@ -365,15 +369,135 @@ with right_col:
     anom_density = anomaly_mask.sum(axis=1).astype(float)
     fig_prof = go.Figure()
     fig_prof.add_trace(go.Bar(
-        x=np.arange(n_steps), y=anom_density,
+        x=depth, y=anom_density,
         marker_color="coral", opacity=0.7,
         name="Аномалий/шаг",
     ))
     fig_prof.update_layout(
         title="Плотность аномалий по глубине",
-        xaxis_title="Step",
+        xaxis_title="Глубина (м)",
         yaxis_title="Count",
         height=300,
         paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(fig_prof, use_container_width=True)
+
+    st.divider()
+    st.header("📍 Позиции аномалий по глубине")
+
+    anom_steps = np.where(anomaly_mask.any(axis=1))[0]
+    if len(anom_steps) > 0:
+        anom_depths = depth[anom_steps]
+        total_depth = depth[-1]
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Начальная глубина", f"{anom_depths.min():.2f} м")
+        col2.metric("Конечная глубина", f"{anom_depths.max():.2f} м")
+        col3.metric("Длина участка", f"{anom_depths.max() - anom_depths.min():.2f} м")
+
+        st.divider()
+        st.subheader("Карта глубины трубы")
+
+        fig_pipe = go.Figure()
+
+        bg = go.Scatter(
+            x=depth, y=np.zeros(n_steps),
+            mode="lines", line=dict(color="gray", width=8),
+            name="Труба", hoverinfo="skip",
+        )
+        fig_pipe.add_trace(bg)
+
+        if len(anom_steps) > 0:
+            fig_pipe.add_trace(go.Scatter(
+                x=anom_depths, y=np.zeros(len(anom_steps)),
+                mode="markers", marker=dict(color=highlight_color, size=5, opacity=0.7),
+                name=f"Аномалии ({len(anom_steps)} шт)",
+            ))
+
+        top_anom_steps = []
+        top_anom_scores = []
+        for s in anom_steps[:100]:
+            ch = np.argmax(scores[s, :])
+            top_anom_steps.append(s)
+            top_anom_scores.append(scores[s, ch])
+
+        if len(top_anom_steps) > 0:
+            fig_pipe.add_trace(go.Scatter(
+                x=depth[top_anom_steps], y=np.zeros(len(top_anom_steps)),
+                mode="markers", marker=dict(
+                    color=top_anom_scores,
+                    size=12,
+                    colorbar=dict(title="Score", x=1.02),
+                    showscale=True,
+                ),
+                name="Топ-100 аномалий",
+            ))
+
+        fig_pipe.update_layout(
+            title=f"Труба: 0 — {total_depth:.2f} м (odomstep={odomstep:.3f} м/шаг)",
+            xaxis_title="Глубина (м)",
+            yaxis_title="",
+            height=150,
+            paper_bgcolor="rgba(0,0,0,0)",
+            showlegend=True,
+            yaxis=dict(showticklabels=False, showgrid=False),
+        )
+        st.plotly_chart(fig_pipe, use_container_width=True)
+
+        st.divider()
+        st.subheader("Таблица аномалий")
+
+        chunk_size = st.slider("Показать первые N участков", 10, 200, 50, key="an_chunk")
+
+        segments = []
+        current_segment = [anom_steps[0]]
+        for i in range(1, len(anom_steps)):
+            if anom_steps[i] - anom_steps[i-1] <= 5:
+                current_segment.append(anom_steps[i])
+            else:
+                segments.append(current_segment)
+                current_segment = [anom_steps[i]]
+        segments.append(current_segment)
+
+        for i, seg in enumerate(segments[:chunk_size]):
+            seg_arr = np.array(seg)
+            seg_depth_start = depth[seg[0]]
+            seg_depth_end = depth[seg[-1]]
+            seg_length = seg_depth_end - seg_depth_start
+            max_score = scores[seg_arr, :].max()
+            n_anom_pixels = anomaly_mask[seg_arr, :].sum()
+
+            with st.expander(
+                f"Участок {i+1}: {seg_depth_start:.1f}–{seg_depth_end:.1f} м "
+                f"(дл={seg_length:.1f}м, аном={n_anom_pixels} пикс., max_score={max_score:.1f})",
+                expanded=False,
+            ):
+                st.caption(f"Шаги: {seg[0]}–{seg[-1]} | Длина: {len(seg)} шагов")
+                seg_scores = scores[seg_arr, :]
+                best_local = np.unravel_index(np.argmax(seg_scores), seg_scores.shape)[0]
+                sample_step = int(seg_arr[best_local])
+                st.caption(f"Пик на шаге {sample_step} (глубина {depth[sample_step]:.2f} м)")
+
+                cross = magnetogram[sample_step, :]
+                cross_anom = anomaly_mask[sample_step, :]
+                angles = np.linspace(0, 360, n_channels, endpoint=False)
+
+                fig_mini = go.Figure()
+                fig_mini.add_trace(go.Scatterpolar(
+                    r=cross, theta=angles, fill="toself",
+                    line=dict(color="steelblue", width=1),
+                    showlegend=False,
+                ))
+                if cross_anom.any():
+                    fig_mini.add_trace(go.Scatterpolar(
+                        r=cross[cross_anom], theta=angles[cross_anom],
+                        mode="markers", marker=dict(color=highlight_color, size=4),
+                        showlegend=False,
+                    ))
+                fig_mini.update_layout(
+                    polar=dict(radialaxis=dict(visible=True, showgrid=False)),
+                    height=300, paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_mini, use_container_width=True)
+    else:
+        st.info("Аномалии не найдены. Попробуйте снизить порог.")
