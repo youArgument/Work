@@ -1,0 +1,12 @@
+[project]
+name = "work"
+version = "0.1.0"
+description = "Magnetogram visualization tools"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit",
+    "numpy",
+    "plotly",
+    "matplotlib",
+    "scipy",
+]
